@@ -1,6 +1,8 @@
-function convertToRawCount(internationalInputString) {
+const cryptoTypes = ['ethereum', 'bitcoin', 'dogecoin'];
+
+async function viewsToCrypto(viewCount, cryptoType) {
   const numberPattern = /([\d,.]+)([kmb]*)/i;
-  const matches = internationalInputString.match(numberPattern);
+  const matches = viewCount.match(numberPattern);
 
   if (!matches) {
     return NaN; // Return NaN if the input doesn't match the expected pattern
@@ -9,7 +11,7 @@ function convertToRawCount(internationalInputString) {
   const numericPart = matches[1];
   const multiplier = matches[2].toLowerCase();
 
-  let numericValue;
+  let viewsNormalized;
 
   const lastChars = [
     numericPart.slice(-1),
@@ -22,9 +24,9 @@ function convertToRawCount(internationalInputString) {
     const parts = numericPart.replace(",", ".").split(".");
     const integerPart = parts[0].replace(/[,]/g, "");
     const decimalPart = parts[1] ? parts[1] : "0";
-    numericValue = parseFloat(integerPart + "." + decimalPart);
+    viewsNormalized = parseFloat(integerPart + "." + decimalPart);
   } else {
-    numericValue = parseFloat(numericPart.replaceAll(",", ""));
+    viewsNormalized = parseFloat(numericPart.replaceAll(",", ""));
   }
 
   let factor = 1;
@@ -41,15 +43,104 @@ function convertToRawCount(internationalInputString) {
       break;
   }
 
-  return Math.round(numericValue * factor);
+  let totalViews = Math.round(viewsNormalized * factor)
+
+  let totalDollars = totalViewsToDollars(totalViews);
+
+  let symbol = cryptoTypeToSymbol(cryptoType);
+
+  let cryptoAmount = await usdToCrypto(totalDollars, cryptoType);
+
+  console.log(`Total views: ${totalViews}`);
+  console.log(`Total dollars: ${totalDollars}`);
+  console.log(`Crypto amount: ${cryptoAmount}`);
+
+  var processed = () => {
+    if (cryptoAmount < 0.1) return cryptoAmount.toFixed(5);
+    return cryptoAmount.toFixed(2);
+  }
+
+  var processedDollars = () => {
+    if (totalDollars < 0.1) return totalDollars.toFixed(5);
+    return totalDollars.toFixed(2);
+  }
+
+  let result = `${processed()} ($${processedDollars()})`;
+
+  console.log(`Result: ${result}`);
+
+  return result;
 }
 
-function convertToDollars(number) {
-  const rawCount = convertToRawCount(number);
+function cryptoTypeToSymbol(cryptoType) {
+  switch (cryptoTypes.indexOf(cryptoType)) {
+    case 0: // ethereum
+      return 'Ξ';
+    case 1: // bitcoin
+      return '₿';
+    case 2: // dogecoin
+      return 'Ð';
+  }
+}
 
-  const processed = rawCount * 0.000026;
-  if (processed < 0.1) return processed.toFixed(5);
-  return processed.toFixed(2);
+function totalViewsToDollars(views) {
+  const processed = views * 0.000026;
+  return processed;
+}
+
+async function getCryptoUSDValue(cryptoName) {
+  try {
+    let usd = 0;
+
+    await new Promise((resolve, reject) => {
+      // try to get the value from chrome extension storage
+      chrome.storage.sync.get([cryptoName], async function (result) {
+        let cache = result[cryptoName];
+
+        if (cache?.expireTime <= new Date().getTime()) {
+          console.log(`Cache for ${cryptoName} expired, getting new value`);
+          cache = null;
+        }
+
+        if (cache) {
+          usd = cache.usd;
+          console.log(`Got ${cryptoName} value from storage: ${usd}`);
+          resolve();
+        } else {
+          let ttl = 60 * 60 // 1 hour
+          let expireTime = new Date().getTime() + ttl * 1000;
+
+          let apiCall = new XMLHttpRequest();
+          apiCall.open('GET', `https://api.coingecko.com/api/v3/simple/price?ids=${cryptoName}&vs_currencies=usd`, false);
+          apiCall.send(null);
+          let response = JSON.parse(apiCall.responseText);
+
+          const data = await response?.[cryptoName];
+
+          console.log(`Got ${cryptoName} value from API: `, response);
+
+          usd = data.usd;
+
+          //  store to chrome extension storage
+          chrome.storage.sync.set({ [cryptoName]: { expireTime, usd } }, function () {
+            console.log(`Set ${cryptoName} value to storage: ${usd}`);
+            resolve();
+          });
+        }
+      });
+    })
+
+    return usd;
+  } catch (error) {
+    console.error(`Could not fetch conversion rate for ${cryptoName}: ${error}`);
+    return null;
+  }
+}
+
+async function usdToCrypto(usd, cryptoName) {
+  const cryptoUSDValue = await getCryptoUSDValue(cryptoName);
+  console.log(`Crypto USD value: `, cryptoUSDValue);
+  return usd / cryptoUSDValue;
 }
 
 const globalSelectors = {};
@@ -65,7 +156,13 @@ innerSelectors.viewSVG = "div div:first-child svg";
 innerSelectors.viewAmount = "div div:last-child span span span";
 innerSelectors.articleViewAmount = "span div:first-child span span span";
 
-function doWork() {
+async function doWork() {
+  for (const cryptoType of cryptoTypes) {
+    await getCryptoUSDValue(cryptoType);
+  }
+
+  let cryptoType = cryptoTypes[0]; // todo - make this configurable
+
   const viewCounts = Array.from(
     document.querySelectorAll(globalSelectors.viewCount)
   );
@@ -73,78 +170,49 @@ function doWork() {
   const articleViewDateSections = document.querySelectorAll(globalSelectors.articleDate);
 
   if (articleViewDateSections.length) {
-    // the rootDateViewsSection will always be the parent->parent->parent of the last element of the articleDate querySelectorAll result
     let rootDateViewsSection = articleViewDateSections[articleViewDateSections.length - 1].parentElement.parentElement.parentElement;
 
-    // if there is one child, that means it's an old tweet with no viewcount
-    // if there are more than 4, we already added the paycheck value
     if (rootDateViewsSection?.children?.length !== 1 && rootDateViewsSection?.children.length < 4) {
-      // clone 2nd and 3rd child of rootDateViewsSection
-      const clonedDateViewSeparator =
-        rootDateViewsSection?.children[1].cloneNode(true);
+      const clonedDateViewSeparator = rootDateViewsSection?.children[1].cloneNode(true);
       const clonedDateView = rootDateViewsSection?.children[2].cloneNode(true);
 
-      // insert clonedDateViews and clonedDateViewsTwo after the 3rd child we just cloned
-      rootDateViewsSection?.insertBefore(
-        clonedDateViewSeparator,
-        rootDateViewsSection?.children[2].nextSibling
-      );
-      rootDateViewsSection?.insertBefore(
-        clonedDateView,
-        rootDateViewsSection?.children[3].nextSibling
-      );
+      rootDateViewsSection?.insertBefore(clonedDateViewSeparator, rootDateViewsSection?.children[2].nextSibling);
+      rootDateViewsSection?.insertBefore(clonedDateView, rootDateViewsSection?.children[3].nextSibling);
 
-      // get view count value from 'clonedDateViewsTwo'
-      const viewCountValue = clonedDateView?.querySelector(
-        innerSelectors.articleViewAmount
-      )?.textContent;
-      const dollarAmount = convertToDollars(viewCountValue);
+      const viewCountValue = clonedDateView?.querySelector(innerSelectors.articleViewAmount)?.textContent;
+      const cryptoAmount = await viewsToCrypto(viewCountValue, cryptoType);
 
-      // replace textContent in cloned clonedDateViews (now 4th child) with converted view count value
-      clonedDateView.querySelector(
-        innerSelectors.articleViewAmount
-      ).textContent = "$" + dollarAmount;
-
-      // remove 'views' label
+      clonedDateView.querySelector(innerSelectors.articleViewAmount).textContent = `${cryptoTypeToSymbol(cryptoType)} ${cryptoAmount}`;
       clonedDateView.querySelector(`span`).children[1].remove();
     }
   }
 
   for (const view of viewCounts) {
-    // only add the dollar box once
     if (!view.classList.contains("replaced")) {
-      // make sure we don't touch this one again
       view.classList.add("replaced");
 
-      // get parent and clone to make dollarBox
       const parent = view.parentElement;
-      const dollarBox = parent.cloneNode(true);
-      dollarBox.classList.add("dollarBox");
+      const cryptoBox = parent.cloneNode(true);
+      cryptoBox.classList.add("cryptoBox");
 
-      // insert dollarBox after view count
-      parent.parentElement.insertBefore(dollarBox, parent.nextSibling);
+      parent.parentElement.insertBefore(cryptoBox, parent.nextSibling);
 
-      // remove view count icon
-      const oldIcon = dollarBox.querySelector(innerSelectors.viewSVG);
+      const oldIcon = cryptoBox.querySelector(innerSelectors.viewSVG);
       oldIcon?.remove();
 
-      // swap the svg for a dollar sign
-      const dollarSpot = dollarBox.querySelector(innerSelectors.dollarSpot)
-        ?.firstChild?.firstChild;
-      dollarSpot.textContent = "$";
-
-      // magic alignment value
-      dollarSpot.style.marginTop = "-0.6rem";
+      const cryptoSpot = cryptoBox.querySelector(innerSelectors.dollarSpot)?.firstChild?.firstChild;
+      cryptoSpot.textContent = cryptoTypeToSymbol(cryptoType);
+      cryptoSpot.style.marginTop = "-0.6rem";
     }
 
-    // get the number of views and calculate & set the dollar amount
-    const dollarBox = view.parentElement.nextSibling.firstChild;
-    const viewCount = view.querySelector(
-      innerSelectors.viewAmount
-    )?.textContent;
+    const cryptoBox = view.parentElement.nextSibling.firstChild;
+    const viewCount = view.querySelector(innerSelectors.viewAmount)?.textContent;
     if (viewCount == undefined) continue;
-    const dollarAmountArea = dollarBox.querySelector(innerSelectors.viewAmount);
-    dollarAmountArea.textContent = convertToDollars(viewCount);
+    const cryptoAmountArea = cryptoBox.querySelector(innerSelectors.viewAmount);
+
+    if (!cryptoAmountArea) continue;
+
+    cryptoAmountArea.textContent = await viewsToCrypto(viewCount, cryptoType);
   }
 }
 
